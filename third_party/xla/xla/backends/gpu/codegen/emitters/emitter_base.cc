@@ -84,9 +84,11 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
+#include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/codegen/emitters/computation_partitioner.h"
 #include "xla/codegen/emitters/elemental_hlo_to_mlir.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
+#include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/emitters/type_util.h"
 #include "xla/hlo/analysis/indexing_analysis.h"
@@ -101,9 +103,9 @@ limitations under the License.
 #include "xla/mlir_hlo/mhlo/transforms/passes.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/dump.h"
+#include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emitter_context.h"
-#include "xla/service/gpu/kernel_arguments.h"
 #include "xla/service/gpu/kernel_reuse_cache.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/llvm_gpu_backend/ptx_version_util.h"
@@ -112,7 +114,9 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/semantic_version.h"
 #include "xla/tsl/framework/mlir/status_scoped_diagnostic_handler.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
@@ -252,6 +256,17 @@ absl::Status RunPassPipeline(mlir::ModuleOp module, const HloModule& hlo_module,
 
 }  // namespace
 
+Value EmitterBase::EmitWorkGroupId(mlir::ImplicitLocOpBuilder& builder,
+                                   WorkGroupDimension dim) const {
+  const auto& counts = launch_dimensions().block_counts();
+  int64_t count = dim == WorkGroupDimension::x   ? counts.x
+                  : dim == WorkGroupDimension::y ? counts.y
+                                                 : counts.z;
+  auto block_id = builder.create<WorkGroupIdOp>(dim);
+  block_id->setAttr("xla.range", builder.getIndexArrayAttr({0, count - 1}));
+  return block_id;
+}
+
 Value EmitterBase::EmitBlockId(mlir::ImplicitLocOpBuilder& builder,
                                int dim) const {
   const auto& counts = launch_dimensions().block_counts();
@@ -279,13 +294,20 @@ llvm::SmallVector<Value> EmitterBase::EmitThreadAndBlockIds(
           EmitBlockId(b, 0),  EmitBlockId(b, 1),  EmitBlockId(b, 2)};
 }
 
+llvm::SmallVector<mlir::Value> EmitterBase::EmitWorkGroupIds(
+    mlir::ImplicitLocOpBuilder& builder) const {
+  return {EmitWorkGroupId(builder, WorkGroupDimension::x),
+          EmitWorkGroupId(builder, WorkGroupDimension::y),
+          EmitWorkGroupId(builder, WorkGroupDimension::z)};
+}
+
 absl::StatusOr<FusionEmissionResult> EmitterBase::Emit(
     IrEmitterContext& ir_emitter_context,
     const HloFusionInstruction& fusion) const {
   VLOG(4) << "Fusion: " << fusion.fused_instructions_computation()->ToString();
-  TF_ASSIGN_OR_RETURN(
-      auto args,
-      KernelArguments::Create(ir_emitter_context.buffer_assignment(), &fusion));
+  TF_ASSIGN_OR_RETURN(auto args, emitters::KernelArguments::Create(
+                                     ir_emitter_context.buffer_assignment(),
+                                     GetDefaultBufferAlignment(), &fusion));
   auto launch_dims = launch_dimensions();
   auto [status_or_entry, cached] =
       ir_emitter_context.kernel_cache().GetWithStatus(
@@ -337,8 +359,8 @@ absl::StatusOr<FusionEmissionResult> EmitterBase::Emit(
 
   FusionEmissionResult result;
   result.thunks.emplace_back(std::make_unique<KernelThunk>(
-      &fusion, entry->kernel_name, args.args(), launch_dims, entry->cluster_dim,
-      entry->shmem_bytes));
+      Thunk::ThunkInfo::WithProfileAnnotation(&fusion), entry->kernel_name,
+      args.args(), launch_dims, entry->cluster_dim, entry->shmem_bytes));
   return result;
 }
 
@@ -392,10 +414,11 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitterBase::CreateMLIRModule(
 
   // Create the entry function.
   SmallVector<mlir::Type> param_types;
-  std::optional<KernelArguments> args;
+  std::optional<emitters::KernelArguments> args;
   if (buffer_assignment != nullptr) {
-    TF_ASSIGN_OR_RETURN(args,
-                        KernelArguments::Create(*buffer_assignment, &fusion));
+    TF_ASSIGN_OR_RETURN(
+        args, emitters::KernelArguments::Create(
+                  *buffer_assignment, GetDefaultBufferAlignment(), &fusion));
   }
   // Annotate tensors with the buffer indices. This way, the buffer propagation
   // pass can clean them up later.
@@ -600,6 +623,7 @@ void AddXlaGpuOpsOptimizationPasses(mlir::OpPassManager& pm) {
 
 void AddLoopTransformationPasses(mlir::OpPassManager& pm,
                                  const se::DeviceDescription& device) {
+  pm.addNestedPass<FuncOp>(CreateLowerXlaSharedPass());
   pm.addNestedPass<FuncOp>(
       emitters::CreateLowerXlaToScfPass(device.threads_per_warp()));
   pm.addNestedPass<FuncOp>(CreateFuseLoopsPass());
@@ -668,6 +692,7 @@ void AddLoweringPasses(mlir::OpPassManager& pm,
     if (cc->has_fp8_support()) {
       pm.addPass(CreateConvertFloatAMDPass(*cc));
     }
+    pm.addPass(CreateRecoverExp2Pass());
   }
 
   pm.addPass(emitters::CreateExpandFloatOpsPass());

@@ -96,6 +96,7 @@ limitations under the License.
 #include "xla/service/global_device_id.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
+#include "xla/service/gpu/gpu_constants.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #ifdef GOOGLE_CUDA
 #include "xla/stream_executor/cuda/cuda_solver_context.h"
@@ -104,6 +105,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/codegen/triton/fusion_emitter.h"
 #include "xla/backends/gpu/runtime/topk.h"
+#include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/service/gpu/execution_stream_assignment.h"
 #include "xla/service/gpu/gpu_conv_runner.h"
 #include "xla/service/gpu/gpu_norm_runner.h"
@@ -112,7 +114,6 @@ limitations under the License.
 #include "xla/service/gpu/ir_emitter.h"
 #include "xla/service/gpu/ir_emitter_context.h"
 #include "xla/service/gpu/ir_emitter_nested.h"
-#include "xla/service/gpu/kernel_arguments.h"
 #include "xla/service/gpu/kernel_reuse_cache.h"
 #include "xla/service/gpu/kernels/custom_kernel.h"
 #include "xla/service/gpu/launch_dimensions.h"
@@ -591,7 +592,7 @@ absl::Status IrEmitterUnnested::EmitConvolutionThunk(
   // always the result and the scratch buffer. It may have auxiliary results in
   // addition to the main result.
   std::vector<BufferAllocation::Slice> result_slices;
-  for (int i = 0; i < instr->shape().tuple_shapes_size() - 1; i++) {
+  for (int i = 0; i < instr->shape().tuple_shapes().size() - 1; i++) {
     TF_ASSIGN_OR_RETURN(BufferAllocation::Slice result_slice,
                         GetAllocationSliceForHlo(instr, {i}));
     result_slices.push_back(result_slice);
@@ -700,9 +701,10 @@ absl::Status IrEmitterUnnested::EmitCublasLtMatmulThunk(
 
   std::optional<BufferAllocation::Slice> workspace_buffer;
   if (instr->shape().IsTuple() &&
-      (instr->shape().tuple_shapes_size() - has_aux_output - 1)) {
-    TF_RET_CHECK((has_aux_output && instr->shape().tuple_shapes_size() == 3) ||
-                 (!has_aux_output && instr->shape().tuple_shapes_size() == 2));
+      (instr->shape().tuple_shapes().size() - has_aux_output - 1)) {
+    TF_RET_CHECK(
+        (has_aux_output && instr->shape().tuple_shapes().size() == 3) ||
+        (!has_aux_output && instr->shape().tuple_shapes().size() == 2));
     TF_ASSIGN_OR_RETURN(workspace_buffer,
                         GetAllocationSliceForHlo(
                             instr, {instr->shape().tuple_shapes_size() - 1}));
@@ -805,7 +807,7 @@ absl::Status IrEmitterUnnested::EmitCublasLtMatmulThunkF8(
   BufferAllocation::Slice aux;  // Not used.
   TF_RET_CHECK(!has_aux_output);
   std::optional<BufferAllocation::Slice> workspace_buffer;
-  if (instr->shape().tuple_shapes_size() - config.damax_output() == 2) {
+  if (instr->shape().tuple_shapes().size() - config.damax_output() == 2) {
     TF_ASSIGN_OR_RETURN(workspace_buffer,
                         GetAllocationSliceForHlo(
                             instr, {instr->shape().tuple_shapes_size() - 1}));
@@ -946,8 +948,9 @@ absl::Status IrEmitterUnnested::EmitCuDnnThunk(
     const HloCustomCallInstruction* instr) {
   TF_ASSIGN_OR_RETURN(
       auto kernel_arguments,
-      KernelArguments::Create(ir_emitter_context_->buffer_assignment(), instr,
-                              instr->operands()));
+      emitters::KernelArguments::Create(
+          ir_emitter_context_->buffer_assignment(), GetDefaultBufferAlignment(),
+          instr, instr->operands()));
   TF_ASSIGN_OR_RETURN(const std::string fingerprint,
                       FingerprintWithBackendConfig<GpuBackendConfig>(*instr));
   // check if sdpa dropout is enabled
@@ -1257,14 +1260,14 @@ absl::Status IrEmitterUnnested::EmitTriangularSolveCustomCall(
   TF_RET_CHECK(instr->operand_count() == 2);
   auto operands = instr->operands();
   TF_RET_CHECK(instr->shape().IsTuple() &&
-               instr->shape().tuple_shapes_size() == 2);
+               instr->shape().tuple_shapes().size() == 2);
 
   // We expect Fortran layout for everything other than the temp buffer (the
   // last operand).  Fortran layout is not XLA default layout with elements 0
   // and 1 swapped.  For example instead of default layout {3,2,1,0} we'd have
   // Fortran layout {2,3,1,0}.
   auto has_fortran_layout = [](const Layout& layout) {
-    int n = layout.minor_to_major_size();
+    int n = layout.minor_to_major().size();
     return layout.minor_to_major(0) == n - 2 &&
            layout.minor_to_major(1) == n - 1;
   };
@@ -1338,7 +1341,7 @@ absl::Status IrEmitterUnnested::EmitTopKCustomCall(
       << "Expect only 1 operand for TopK custom call.";
   TF_RET_CHECK(shape.IsTuple())
       << "Expect TopK custom call to have tuple shape.";
-  TF_RET_CHECK(shape.tuple_shapes_size() == 2)
+  TF_RET_CHECK(shape.tuple_shapes().size() == 2)
       << "Expect TopK custom call shape to have exactly 2 sub-shapes.";
 
   auto data_shape = operands[0]->shape();
@@ -1368,10 +1371,10 @@ absl::Status IrEmitterUnnested::EmitTopKCustomCall(
                                   batch_size, platform_name(), wavefront_size));
 
   // Prepare kernel arguments.
-  TF_ASSIGN_OR_RETURN(
-      auto kernel_arguments,
-      KernelArguments::Create(ir_emitter_context_->buffer_assignment(), instr,
-                              operands));
+  TF_ASSIGN_OR_RETURN(auto kernel_arguments,
+                      emitters::KernelArguments::Create(
+                          ir_emitter_context_->buffer_assignment(),
+                          GetDefaultBufferAlignment(), instr, operands));
 
   auto thunk = std::make_unique<CustomKernelThunk>(
       instr, std::move(kernel), std::move(kernel_arguments.args()));
@@ -1434,9 +1437,10 @@ absl::Status IrEmitterUnnested::EmitTritonCustomCall(
 
     TF_ASSIGN_OR_RETURN(
         auto kernel_arguments,
-        KernelArguments::Create(ir_emitter_context_->buffer_assignment(), instr,
-                                instr->operands(),
-                                /*dedup=*/false));
+        emitters::KernelArguments::Create(
+            ir_emitter_context_->buffer_assignment(),
+            GetDefaultBufferAlignment(), instr, instr->operands(),
+            /*dedup=*/false));
     auto launch_dimensions =
         LaunchDimensions(se::BlockDim(call.grid_x, call.grid_y, call.grid_z),
                          se::ThreadDim(call.num_warps * 32));
@@ -1497,15 +1501,16 @@ absl::Status IrEmitterUnnested::EmitTritonCustomCall(
           instr->raw_backend_config_string(), generate);
   TF_ASSIGN_OR_RETURN(const KernelReuseCache::Entry* entry, status_or_entry);
 
-  TF_ASSIGN_OR_RETURN(
-      auto kernel_arguments,
-      KernelArguments::Create(ir_emitter_context_->buffer_assignment(), instr,
-                              instr->operands(),
-                              /*dedup=*/false));
+  TF_ASSIGN_OR_RETURN(auto kernel_arguments,
+                      emitters::KernelArguments::Create(
+                          ir_emitter_context_->buffer_assignment(),
+                          GetDefaultBufferAlignment(), instr, instr->operands(),
+                          /*dedup=*/false));
 
   AddThunkToThunkSequence(std::make_unique<KernelThunk>(
-      instr, entry->kernel_name, kernel_arguments.args(),
-      entry->launch_dimensions, entry->cluster_dim, entry->shmem_bytes));
+      Thunk::ThunkInfo::WithProfileAnnotation(instr), entry->kernel_name,
+      kernel_arguments.args(), entry->launch_dimensions, entry->cluster_dim,
+      entry->shmem_bytes));
   return absl::OkStatus();
 }
 
@@ -1859,7 +1864,7 @@ absl::Status IrEmitterUnnested::EmitCollectivePermute(
     const HloCollectivePermuteInstruction* instr) {
   // First output is aliased.
   TF_RET_CHECK(
-      instr->shape().IsTuple() && instr->shape().tuple_shapes_size() == 2 &&
+      instr->shape().IsTuple() && instr->shape().tuple_shapes().size() == 2 &&
       Shape::Equal().IgnoreMemorySpaceInLayout()(
           instr->shape().tuple_shapes(0), instr->shape().tuple_shapes(1)));
 
@@ -2168,7 +2173,7 @@ static const HloInstruction* FindCanonicalSendRecvStartOp(
 
   // Extract canonical start op from while loop's init.
   CHECK(while_op != nullptr);
-  CHECK(0 <= i && i < while_op->shape().tuple_shapes_size());
+  CHECK(0 <= i && i < while_op->shape().tuple_shapes().size());
   const HloInstruction* init = while_op->operand(0);
   const HloInstruction* canonical_start_op = init->operand(i);
   CHECK(canonical_start_op->opcode() == HloOpcode::kSend ||
@@ -2285,15 +2290,15 @@ absl::Status IrEmitterUnnested::EmitOutfeed(
 absl::StatusOr<std::pair<std::vector<llvm_ir::IrArray> /*inputs*/,
                          std::vector<llvm_ir::IrArray> /*outputs*/>>
 IrEmitterUnnested::BuildKernelThunkForNonFusionOp(
-    const HloInstruction* hlo,
+    const HloInstruction* instr,
     absl::Span<const HloInstruction* const> needed_operands,
     const LaunchDimensions& launch_dimensions) {
-  std::string suggested_kernel_name(hlo->name());
+  std::string suggested_kernel_name(instr->name());
 
-  TF_ASSIGN_OR_RETURN(
-      auto kernel_arguments,
-      KernelArguments::Create(ir_emitter_context_->buffer_assignment(), hlo,
-                              needed_operands));
+  TF_ASSIGN_OR_RETURN(auto kernel_arguments,
+                      emitters::KernelArguments::Create(
+                          ir_emitter_context_->buffer_assignment(),
+                          GetDefaultBufferAlignment(), instr, needed_operands));
 
   VLOG(3) << "Generating (without reuse check): " << suggested_kernel_name;
 
@@ -2308,7 +2313,8 @@ IrEmitterUnnested::BuildKernelThunkForNonFusionOp(
                            &b_));
 
   AddThunkToThunkSequence(std::make_unique<KernelThunk>(
-      hlo, kernel->getName().str(), kernel_arguments.args(), launch_dimensions,
+      Thunk::ThunkInfo::WithProfileAnnotation(instr), kernel->getName().str(),
+      kernel_arguments.args(), launch_dimensions,
       /*cluster_dim=*/std::nullopt,
       /*shmem_bytes=*/0));
 

@@ -149,17 +149,7 @@ class TfrtCpuClient final : public CommonPjRtClient {
       std::optional<absl::Span<const std::optional<Layout>>> device_layouts,
       PjRtMemorySpace* memory_space) override;
 
-  absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostBuffer(
-      const void* data, PrimitiveType type, absl::Span<int64_t const> dims,
-      std::optional<absl::Span<int64_t const>> byte_strides,
-      HostBufferSemantics host_buffer_semantics,
-      absl::AnyInvocable<void() &&> on_done_with_host_buffer,
-      PjRtMemorySpace* memory_space, const Layout* device_layout) override;
-
   using PjRtClient::BufferFromHostLiteral;
-  absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
-      const LiteralSlice& literal, PjRtMemorySpace* memory_space,
-      const Layout* device_layout) override;
 
   absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
   MakeCrossHostReceiveBuffers(absl::Span<const Shape> shapes,
@@ -168,10 +158,9 @@ class TfrtCpuClient final : public CommonPjRtClient {
     return Unimplemented("MakeCrossHostReceiveBuffers not implemented.");
   }
 
-  absl::StatusOr<std::unique_ptr<PjRtBuffer>> CreateViewOfDeviceBuffer(
-      void* device_ptr, const Shape& shape, PjRtMemorySpace* memory_space,
-      std::function<void()> on_delete_callback,
-      std::optional<std::intptr_t> stream) override;
+  absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>> ImportForeignMemory(
+      void* device_ptr, absl::AnyInvocable<void() &&> on_delete_callback,
+      size_t on_device_bytes_count, PjRtMemorySpace* memory_space) override;
 
   tsl::thread::ThreadPool* pjrt_client_thread_pool() const {
     return pjrt_client_thread_pool_.get();
@@ -185,14 +174,21 @@ class TfrtCpuClient final : public CommonPjRtClient {
     return eigen_intraop_device_.get();
   }
 
-  tsl::AsyncValueRef<CpuEvent> GetLastCollectiveLaunchEvent() {
-    absl::MutexLock lock(&mu_);
-    return last_collective_launch_event_.CopyRef();
-  }
+  // Returns a pair of async events:
+  // - async event that signals the completion of the last collective launch
+  // - count down event that must be signalled when each rank completes
+  //   a collective launch
+  using CollectiveLaunchEvent =
+      std::pair<tsl::AsyncValueRef<CpuEvent>,
+                tsl::CountDownAsyncValueRef<CpuEvent>>;
 
-  void SetLastCollectiveLaunchEvent(tsl::AsyncValueRef<CpuEvent> event) {
+  CollectiveLaunchEvent GetLastCollectiveLaunchEvent(
+      size_t num_addressable_devices) {
+    tsl::CountDownAsyncValueRef<CpuEvent> count_down(num_addressable_devices);
     absl::MutexLock lock(&mu_);
-    last_collective_launch_event_ = std::move(event);
+    auto last_launch = std::move(last_collective_launch_event_);
+    last_collective_launch_event_ = count_down.AsRef();
+    return std::make_pair(std::move(last_launch), std::move(count_down));
   }
 
   tsl::AsyncValueRef<CpuEvent> GetLastEnqueueEvent() {
@@ -221,14 +217,33 @@ class TfrtCpuClient final : public CommonPjRtClient {
       const Shape& on_device_shape,
       tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,
       absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>
-          definition_device_events) override;
+          definition_device_events,
+      bool raw_buffer_is_mutable) override;
 
   absl::StatusOr<int64_t> GetOnDeviceBytesCount(
       PjRtMemorySpace* memory_space, const xla::Shape& shape) const override;
 
+  absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>> LinearizeHostBufferInto(
+      const void* data, PrimitiveType type, absl::Span<int64_t const> dims,
+      std::optional<absl::Span<int64_t const>> byte_strides,
+      HostBufferSemantics host_buffer_semantics,
+      absl::AnyInvocable<void() &&> on_done_with_host_buffer,
+      const xla::Shape& device_shape,
+      tsl::RCReference<CommonPjRtRawBuffer> raw_buffer) override;
+
   absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>> LinearizeInto(
       const LiteralSlice& literal, const xla::Layout& layout,
       tsl::RCReference<CommonPjRtRawBuffer> raw_buffer) override;
+
+  absl::StatusOr<xla::Shape> MakeDefaultShapeForMemorySpace(
+      PjRtMemorySpace* memory_space, xla::Shape shape,
+      const xla::Layout* layout) const override;
+
+  bool BufferFromHostBufferSupportsZeroCopy(
+      const void* data, PrimitiveType type, absl::Span<int64_t const> dims,
+      std::optional<absl::Span<int64_t const>> byte_strides, const Shape& shape,
+      PjRtMemorySpace* memory_space,
+      const Layout* device_layout) const override;
 
  private:
   friend class TfrtCpuExecutable;
@@ -408,7 +423,7 @@ class TfrtCpuExecutable final : public PjRtLoadedExecutable {
       return tsl::errors::FailedPrecondition(
           "cpu_executable_ has no buffer_assignment_proto.");
     }
-    memory_stats.buffer_assignment = *proto;
+    memory_stats.serialized_buffer_assignment = proto->SerializeAsString();
     memory_stats.PopulateBufferStatsFromAllocations(
         cpu_executable_->GetAllocations());
     return memory_stats;
@@ -466,7 +481,7 @@ class TfrtCpuExecutable final : public PjRtLoadedExecutable {
   absl::StatusOr<Result> ExecuteHelper(
       absl::Span<PjRtBuffer* const> argument_handles, int replica,
       int partition, const RunId& run_id, const ExecuteOptions& options,
-      tsl::AsyncValueRef<CpuEvent> last_collective_launch_event,
+      TfrtCpuClient::CollectiveLaunchEvent last_collective_launch_event,
       bool fill_future, TfrtCpuDevice* device = nullptr);
 
   TfrtCpuClient* client_;
